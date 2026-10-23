@@ -6,6 +6,7 @@ import helmet from 'helmet';
 import morgan from 'morgan';
 import { env } from './config/env.js';
 import { errorHandler, notFound } from './middlewares/errorHandler.js';
+import { verifyOrigin } from './middlewares/auth.js';
 import { apiLimiter, sanitizeBody } from './middlewares/security.js';
 import { router } from './routes/index.js';
 
@@ -27,6 +28,7 @@ export function createApp() {
   app.use(express.json({ limit: '100kb' }));
   app.use(cookieParser());
   app.use(sanitizeBody);
+  app.use(verifyOrigin);
   if (env.NODE_ENV !== 'test') app.use(morgan(env.isProduction ? 'combined' : 'dev'));
 
   app.get('/', (_req, res) => {

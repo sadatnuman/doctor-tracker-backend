@@ -1,4 +1,5 @@
 import type { Request, Response } from 'express';
+import * as authService from '../services/auth.service.js';
 import * as doctorService from '../services/doctor.service.js';
 import * as patientService from '../services/patient.service.js';
 
@@ -37,4 +38,17 @@ export async function addPatient(req: Request, res: Response) {
 export async function removePatient(req: Request, res: Response) {
   const { id, patientId } = req.validated.params;
   res.json({ data: await patientService.deletePatient(patientId, id) });
+}
+
+export async function setAccount(req: Request, res: Response) {
+  res.json({ data: await authService.setDoctorAccount(req.validated.params.id, req.validated.body.password) });
+}
+
+/** The signed-in doctor's own roster entry. */
+export async function getMine(req: Request, res: Response) {
+  res.json({ data: await doctorService.getDoctor(req.user!.doctorId!) });
+}
+
+export async function updateMyAvailability(req: Request, res: Response) {
+  res.json({ data: await doctorService.updateAvailability(req.user!.doctorId!, req.validated.body) });
 }

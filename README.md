@@ -66,6 +66,23 @@ See [`.env.example`](./.env.example).
 
 The server validates its environment on boot and exits with a clear message if anything is missing.
 
+<details>
+<summary><b>Troubleshooting:</b> <code>querySrv ECONNREFUSED _mongodb._tcp…</code></summary>
+
+Some local networks, VPNs or secure-DNS tools block the DNS **SRV** lookup that `mongodb+srv://` strings need. Use Atlas's standard connection string instead (Atlas → Connect → Drivers → toggle **"Legacy URI String"**), or build it from the cluster's records:
+
+```bash
+nslookup -type=SRV _mongodb._tcp.<cluster>.mongodb.net   # host list
+nslookup -type=TXT <cluster>.mongodb.net                 # replicaSet + authSource
+```
+
+```
+MONGODB_URI=mongodb://USER:PASS@host-00:27017,host-01:27017,host-02:27017/doctor-tracker?tls=true&replicaSet=<name>&authSource=admin&retryWrites=true&w=majority
+```
+
+Cloud hosts like Render resolve SRV records normally, so production can keep the `mongodb+srv://` form.
+</details>
+
 ### Scripts
 
 | Command | What it does |

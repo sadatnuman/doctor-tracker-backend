@@ -12,18 +12,18 @@ const app = createApp();
 const agent = request.agent(app); // keeps the auth cookie between requests
 
 const doctorInput = {
-  name: 'Dr. Ada Lovelace',
+  name: 'Dr. Nusrat Jahan',
   specialization: 'Cardiology',
-  hospital: 'Riverside General Hospital',
-  phone: '+1 555 010 2000',
-  email: 'ada@example.com',
+  hospital: 'Dhanmondi Lakeview Hospital',
+  phone: '+880 1712-345678',
+  email: 'nusrat@example.com',
 };
 
 const patientInput = {
-  name: 'Grace Hopper',
+  name: 'Sadia Islam',
   age: 54,
   gender: 'Female',
-  phone: '+1 555 010 3000',
+  phone: '+880 1811-223344',
   condition: 'Hypertension',
   status: 'Active',
   admissionDate: '2026-01-15',
@@ -33,7 +33,7 @@ beforeAll(async () => {
   mongo = await MongoMemoryServer.create();
   await connectDB(mongo.getUri());
   await Promise.all([UserModel.init(), DoctorModel.init(), PatientModel.init()]);
-  await UserModel.create({ name: 'Admin', email: 'admin@test.dev', password: 'Password123!' });
+  await UserModel.create({ name: 'Admin', email: 'admin@test.dev', password: 'Password123!', role: 'admin' });
 });
 
 afterAll(async () => {
@@ -46,6 +46,7 @@ describe('auth', () => {
     const res = await request(app).get('/api/doctors');
     expect(res.status).toBe(401);
     expect(res.body.error.code).toBe('UNAUTHORIZED');
+    expect((await request(app).get('/api/doctors').set('Cookie', 'dt_access=forged')).body.error.code).toBe('TOKEN_EXPIRED');
   });
 
   it('rejects bad credentials with a generic message', async () => {
@@ -63,14 +64,14 @@ describe('auth', () => {
   it('logs in and sets an httpOnly cookie', async () => {
     const res = await agent.post('/api/auth/login').send({ email: 'ADMIN@test.dev', password: 'Password123!' });
     expect(res.status).toBe(200);
-    expect(res.headers['set-cookie']?.[0]).toMatch(/dt_token=.+HttpOnly/i);
+    expect(res.headers['set-cookie']?.[0]).toMatch(/dt_access=.+HttpOnly/i);
     const me = await agent.get('/api/auth/me');
     expect(me.body.data.email).toBe('admin@test.dev');
   });
 
   it('accepts a Bearer token', async () => {
     const login = await request(app).post('/api/auth/login').send({ email: 'admin@test.dev', password: 'Password123!' });
-    const res = await request(app).get('/api/auth/me').set('Authorization', `Bearer ${login.body.data.token}`);
+    const res = await request(app).get('/api/auth/me').set('Authorization', `Bearer ${login.body.data.accessToken}`);
     expect(res.status).toBe(200);
   });
 });
@@ -112,18 +113,18 @@ describe('doctors & patients', () => {
   });
 
   it('searches, filters and paginates doctors', async () => {
-    await agent.post('/api/doctors').send({ ...doctorInput, name: 'Dr. Alan Turing', email: 'alan@example.com', specialization: 'Neurology' });
+    await agent.post('/api/doctors').send({ ...doctorInput, name: 'Dr. Tanvir Hossain', email: 'tanvir@example.com', specialization: 'Neurology' });
 
-    const search = await agent.get('/api/doctors').query({ search: 'dr. ad' });
+    const search = await agent.get('/api/doctors').query({ search: 'dr. nu' });
     expect(search.body.data).toHaveLength(1);
     expect(search.body.data[0].patientCount).toBe(1);
 
     const filtered = await agent.get('/api/doctors').query({ specialization: 'Neurology' });
-    expect(filtered.body.data.map((d: { name: string }) => d.name)).toEqual(['Dr. Alan Turing']);
+    expect(filtered.body.data.map((d: { name: string }) => d.name)).toEqual(['Dr. Tanvir Hossain']);
 
     const paged = await agent.get('/api/doctors').query({ limit: 1, page: 2, sort: 'name' });
     expect(paged.body.meta).toMatchObject({ page: 2, limit: 1, total: 2, totalPages: 2, hasPrevPage: true, hasNextPage: false });
-    expect(paged.body.data[0].name).toBe('Dr. Alan Turing');
+    expect(paged.body.data[0].name).toBe('Dr. Tanvir Hossain');
   });
 
   it('filters patients by condition and date range', async () => {
@@ -151,7 +152,7 @@ describe('doctors & patients', () => {
   });
 
   it('only deletes a patient through the doctor it belongs to', async () => {
-    const other = await agent.get('/api/doctors').query({ search: 'dr. alan' });
+    const other = await agent.get('/api/doctors').query({ search: 'dr. tan' });
     const wrong = await agent.delete(`/api/doctors/${other.body.data[0].id}/patients/${patientId}`);
     expect(wrong.status).toBe(404);
     const right = await agent.delete(`/api/doctors/${doctorId}/patients/${patientId}`);
@@ -169,7 +170,7 @@ describe('stats', () => {
     const doctor = await DoctorModel.findOne().lean();
     await PatientModel.create([
       { ...patientInput, doctor: doctor!._id, admissionDate: new Date() },
-      { ...patientInput, name: 'Ken Thompson', status: 'Critical', doctor: doctor!._id, admissionDate: new Date() },
+      { ...patientInput, name: 'Kamrul Hasan', status: 'Critical', doctor: doctor!._id, admissionDate: new Date() },
     ]);
     const res = await agent.get('/api/stats/overview');
     expect(res.status).toBe(200);

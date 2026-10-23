@@ -1,10 +1,15 @@
 import type { RequestHandler } from 'express';
-import rateLimit from 'express-rate-limit';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { env } from '../config/env.js';
 
-/** Brute-force protection on the login endpoint. */
+/**
+ * Brute-force protection on the login endpoint, keyed by client IP + target email.
+ * Requests arrive through the frontend's rewrite proxy, so IP alone would lump
+ * unrelated users together and let one attacker lock everyone out.
+ */
 export const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
+  keyGenerator: (req) => `${ipKeyGenerator(req.ip ?? '')}:${String(req.body?.email ?? '').toLowerCase()}`,
   limit: env.NODE_ENV === 'test' ? 1000 : 10,
   standardHeaders: 'draft-8',
   legacyHeaders: false,

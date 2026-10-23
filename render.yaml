@@ -18,8 +18,14 @@ services:
         value: "22"
       - key: COOKIE_SECURE
         value: "true"
-      - key: JWT_EXPIRES_IN
-        value: 1d
+      - key: ACCESS_TOKEN_TTL
+        value: 15m
+      - key: REFRESH_TOKEN_TTL_DAYS
+        value: "7"
+      - key: CLINIC_TIMEZONE
+        value: Asia/Dhaka
+      - key: PAYMENT_HOLD_MINUTES
+        value: "5"
       - key: MONGODB_URI
         sync: false
       - key: JWT_SECRET

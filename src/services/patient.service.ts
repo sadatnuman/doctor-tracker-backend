@@ -62,8 +62,16 @@ export async function listPatients(q: ListPatientsQuery) {
   return { data: docs.map(serialize), meta: buildPaginationMeta(q.page, q.limit, total) };
 }
 
-export async function getPatient(id: string) {
-  const patient = await PatientModel.findById(id).populate('doctor', DOCTOR_FIELDS).lean();
+/**
+ * Ownership scope for patient records: admins act on any record, doctors only on
+ * records in their own list (a foreign id is reported as not found).
+ */
+export function ownerScope(user?: { role: string; doctorId?: string }) {
+  return user?.role === 'doctor' ? { doctor: new Types.ObjectId(user.doctorId) } : {};
+}
+
+export async function getPatient(id: string, scope: Record<string, unknown> = {}) {
+  const patient = await PatientModel.findOne({ _id: id, ...scope }).populate('doctor', DOCTOR_FIELDS).lean();
   if (!patient) throw ApiError.notFound('Patient');
   return serialize(patient);
 }
@@ -75,12 +83,15 @@ export async function createPatient(input: CreatePatientInput) {
   return serialize(patient.toObject());
 }
 
-export async function updatePatient(id: string, input: UpdatePatientInput) {
+export async function updatePatient(id: string, input: UpdatePatientInput, scope: Record<string, unknown> = {}) {
   if (input.doctor) await assertDoctorExists(input.doctor);
   const { email, ...rest } = input;
   // An empty email in the form means "remove it".
   const update = 'email' in input && !email ? { $set: rest, $unset: { email: 1 } } : { $set: input };
-  const patient = await PatientModel.findByIdAndUpdate(id, update, { returnDocument: 'after', runValidators: true })
+  const patient = await PatientModel.findOneAndUpdate({ _id: id, ...scope }, update, {
+    returnDocument: 'after',
+    runValidators: true,
+  })
     .populate('doctor', DOCTOR_FIELDS)
     .lean();
   if (!patient) throw ApiError.notFound('Patient');

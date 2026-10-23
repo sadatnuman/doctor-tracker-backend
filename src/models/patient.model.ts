@@ -15,11 +15,19 @@ const patientSchema = new Schema(
     admissionDate: { type: Date, required: true, default: () => new Date() },
     notes: { type: String, trim: true, maxlength: 1000 },
     doctor: { type: Schema.Types.ObjectId, ref: 'Doctor', required: true },
+    /** Set when the record was opened from a paid online booking. */
+    user: { type: Schema.Types.ObjectId, ref: 'User' },
   },
   { timestamps: true, toJSON: toJSONOptions },
 );
 
 patientSchema.plugin(nameLowerPlugin);
+
+// One record per (patient account, doctor): repeat bookings reuse it.
+patientSchema.index(
+  { user: 1, doctor: 1 },
+  { unique: true, partialFilterExpression: { user: { $exists: true } } },
+);
 
 // "Patients of doctor X, newest first" + per-doctor aggregation on the dashboard.
 patientSchema.index({ doctor: 1, admissionDate: -1 });

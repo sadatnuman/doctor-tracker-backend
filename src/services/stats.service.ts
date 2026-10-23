@@ -1,5 +1,7 @@
+import { AppointmentModel } from '../models/appointment.model.js';
 import { DoctorModel } from '../models/doctor.model.js';
 import { PatientModel } from '../models/patient.model.js';
+import { PaymentModel } from '../models/payment.model.js';
 import { dateRange } from '../utils/query.js';
 import type { OverviewQuery } from '../validators/stats.validator.js';
 
@@ -55,12 +57,22 @@ export async function getOverview(q: OverviewQuery) {
   const previousRange = { admissionDate: { $gte: new Date(from.getTime() - spanMs), $lt: from } };
   const timeBucket = { $dateTrunc: { date: '$admissionDate', unit: interval, startOfWeek: 'monday', timezone: 'UTC' } };
 
-  const [totalDoctors, totalPatients, previousPeriodPatients, newDoctors, doctorFacets, patientFacets] =
+  const [totalDoctors, totalPatients, previousPeriodPatients, newDoctors, appointmentRows, revenueRows, doctorFacets, patientFacets] =
     await Promise.all([
       DoctorModel.estimatedDocumentCount(),
       PatientModel.estimatedDocumentCount(),
       PatientModel.countDocuments(previousRange),
       DoctorModel.countDocuments({ createdAt: dateRange(from, to) }),
+      // Online bookings in range by status, served by { status, start }.
+      AppointmentModel.aggregate<CountRow>([
+        { $match: { start: dateRange(from, to) } },
+        { $group: { _id: '$status', count: { $sum: 1 } } },
+      ]),
+      // Collected (not refunded) revenue, served by { status, paidAt }.
+      PaymentModel.aggregate<{ total: number; count: number }>([
+        { $match: { status: 'paid', paidAt: dateRange(from, to) } },
+        { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } },
+      ]),
       DoctorModel.aggregate<{ bySpecialization: CountRow[] }>([
         {
           $facet: {
@@ -135,7 +147,12 @@ export async function getOverview(q: OverviewQuery) {
         : null,
       newDoctorsInRange: newDoctors,
       criticalInRange: p.byStatus.find((s) => s._id === 'Critical')?.count ?? 0,
+      bookingsInRange: appointmentRows
+        .filter((r) => r._id === 'confirmed' || r._id === 'completed')
+        .reduce((sum, r) => sum + r.count, 0),
+      revenueInRange: revenueRows[0]?.total ?? 0,
     },
+    appointmentsByStatus: toCounts(appointmentRows, 'status'),
     patientsOverTime: fillSeries(p.timeline, from, to, interval),
     patientsPerDoctor: p.topDoctors.map((d) => ({
       doctorId: String(d._id),

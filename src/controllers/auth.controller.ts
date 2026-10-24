@@ -1,5 +1,5 @@
 import type { Request, Response } from 'express';
-import { ACCESS_COOKIE, REFRESH_COOKIE } from '../config/constants.js';
+import { ACCESS_COOKIE, REFRESH_COOKIE, SESSION_HINT_COOKIE } from '../config/constants.js';
 import * as authService from '../services/auth.service.js';
 import * as avatarService from '../services/avatar.service.js';
 
@@ -9,12 +9,14 @@ function setSessionCookies(res: Response, session: authService.Session) {
   const base = authService.baseCookieOptions();
   res.cookie(ACCESS_COOKIE, session.accessToken, { ...base, maxAge: session.accessMaxAge });
   res.cookie(REFRESH_COOKIE, session.refreshToken, { ...base, maxAge: session.refreshMaxAge });
+  res.cookie(SESSION_HINT_COOKIE, '1', { ...base, httpOnly: false, maxAge: session.refreshMaxAge });
 }
 
 function clearSessionCookies(res: Response) {
   const base = authService.baseCookieOptions();
   res.clearCookie(ACCESS_COOKIE, base);
   res.clearCookie(REFRESH_COOKIE, base);
+  res.clearCookie(SESSION_HINT_COOKIE, { ...base, httpOnly: false });
 }
 
 /** Body never contains the refresh token: it only ever travels in its httpOnly cookie. */

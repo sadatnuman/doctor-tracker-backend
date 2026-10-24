@@ -4,6 +4,8 @@ export type Role = (typeof ROLES)[number];
 /** Short-lived JWT (sent on every request) and opaque rotating refresh token. */
 export const ACCESS_COOKIE = 'dt_access';
 export const REFRESH_COOKIE = 'dt_refresh';
+/** Non-secret, readable by JS: lets the frontend skip session calls for visitors. */
+export const SESSION_HINT_COOKIE = 'dt_session';
 
 /**
  * pending_payment → (paid within the hold) → confirmed → completed

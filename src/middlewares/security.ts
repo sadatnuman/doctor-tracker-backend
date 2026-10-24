@@ -42,6 +42,25 @@ function stripOperators(value: unknown): unknown {
 
 /** Defense in depth against NoSQL operator injection (`{ "$gt": "" }`) in bodies. */
 export const sanitizeBody: RequestHandler = (req, _res, next) => {
-  if (req.body && typeof req.body === 'object') req.body = stripOperators(req.body);
+  if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) req.body = stripOperators(req.body);
   next();
 };
+
+/** Registration and token refresh: generous for real users, hostile to scripted abuse. */
+export const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: env.NODE_ENV === 'test' ? 10_000 : 60,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { error: { code: 'TOO_MANY_REQUESTS', message: 'Too many attempts. Try again in a few minutes.' } },
+});
+
+/** Stops one account from grabbing and releasing slots in a loop. */
+export const bookingLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  limit: env.NODE_ENV === 'test' ? 10_000 : 10,
+  keyGenerator: (req) => req.user?.id ?? ipKeyGenerator(req.ip ?? ''),
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { error: { code: 'TOO_MANY_REQUESTS', message: 'Too many bookings in a short time. Please wait a few minutes.' } },
+});

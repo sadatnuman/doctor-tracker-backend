@@ -1,20 +1,100 @@
 import type { Request, Response } from 'express';
-import { AUTH_COOKIE } from '../config/constants.js';
+import { ACCESS_COOKIE, REFRESH_COOKIE, SESSION_HINT_COOKIE } from '../config/constants.js';
 import * as authService from '../services/auth.service.js';
+import * as avatarService from '../services/avatar.service.js';
+
+const meta = (req: Request): authService.RequestMeta => ({ userAgent: req.get('user-agent'), ip: req.ip });
+
+function setSessionCookies(res: Response, session: authService.Session) {
+  const base = authService.baseCookieOptions();
+  res.cookie(ACCESS_COOKIE, session.accessToken, { ...base, maxAge: session.accessMaxAge });
+  res.cookie(REFRESH_COOKIE, session.refreshToken, { ...base, maxAge: session.refreshMaxAge });
+  res.cookie(SESSION_HINT_COOKIE, '1', { ...base, httpOnly: false, maxAge: session.refreshMaxAge });
+}
+
+function clearSessionCookies(res: Response) {
+  const base = authService.baseCookieOptions();
+  res.clearCookie(ACCESS_COOKIE, base);
+  res.clearCookie(REFRESH_COOKIE, base);
+  res.clearCookie(SESSION_HINT_COOKIE, { ...base, httpOnly: false });
+}
+
+/** Body never contains the refresh token: it only ever travels in its httpOnly cookie. */
+const sessionBody = (session: authService.Session) => ({
+  data: { user: session.user, accessToken: session.accessToken, expiresIn: session.accessMaxAge / 1000 },
+});
 
 export async function login(req: Request, res: Response) {
   const { email, password } = req.validated.body;
-  const { user, token } = await authService.login(email, password);
-  res.cookie(AUTH_COOKIE, token, authService.authCookieOptions(token));
-  // The token is also returned for non-browser API clients (Bearer auth).
-  res.json({ data: { user, token } });
+  const session = await authService.login(email, password, meta(req));
+  setSessionCookies(res, session);
+  res.json(sessionBody(session));
 }
 
-export function logout(_req: Request, res: Response) {
-  res.clearCookie(AUTH_COOKIE, authService.baseCookieOptions());
+export async function register(req: Request, res: Response) {
+  const session = await authService.registerPatient(req.validated.body, meta(req));
+  setSessionCookies(res, session);
+  res.status(201).json(sessionBody(session));
+}
+
+export async function refresh(req: Request, res: Response) {
+  try {
+    const session = await authService.refresh(req.cookies?.[REFRESH_COOKIE], meta(req));
+    setSessionCookies(res, session);
+    res.json(sessionBody(session));
+  } catch (error) {
+    // Keep a racing tab's fresh cookies; clear them for every other failure.
+    if ((error as { code?: string }).code !== 'REFRESH_RACE') clearSessionCookies(res);
+    throw error;
+  }
+}
+
+export async function logout(req: Request, res: Response) {
+  await authService.logout(req.cookies?.[REFRESH_COOKIE]);
+  clearSessionCookies(res);
+  res.status(204).end();
+}
+
+export async function logoutAll(req: Request, res: Response) {
+  await authService.logoutAll(req.user!.id);
+  clearSessionCookies(res);
   res.status(204).end();
 }
 
 export async function me(req: Request, res: Response) {
-  res.json({ data: await authService.getUserById(req.user!.id) });
+  res.json({ data: await authService.getMe(req.user!.id) });
+}
+
+export async function updateProfile(req: Request, res: Response) {
+  res.json({ data: await authService.updateProfile(req.user!.id, req.validated.body) });
+}
+
+export async function changePassword(req: Request, res: Response) {
+  const session = await authService.changePassword(req.user!.id, req.validated.body, meta(req));
+  setSessionCookies(res, session);
+  res.json(sessionBody(session));
+}
+
+export async function uploadAvatar(req: Request, res: Response) {
+  res.json({ data: await avatarService.setAvatar(req.user!.id, req.body) });
+}
+
+export async function deleteAvatar(req: Request, res: Response) {
+  res.json({ data: await avatarService.removeAvatar(req.user!.id) });
+}
+
+/** Public: profile pictures appear on doctors' public pages. Versioned URLs cache forever. */
+export async function getAvatar(req: Request, res: Response) {
+  const avatar = await avatarService.getAvatar(req.validated.params.id);
+  const etag = `"${avatar.updatedAt?.getTime() ?? 0}"`;
+  res.set({
+    'Content-Type': avatar.contentType,
+    'Cache-Control': req.query.v ? 'public, max-age=31536000, immutable' : 'public, max-age=300',
+    ETag: etag,
+    'X-Content-Type-Options': 'nosniff',
+  });
+  if (req.headers['if-none-match'] === etag) return res.status(304).end();
+  // Lean reads return the driver's Binary wrapper; send the raw bytes.
+  const data = avatar.data as unknown as Buffer | { buffer: Uint8Array };
+  res.send(Buffer.isBuffer(data) ? data : Buffer.from(data.buffer));
 }

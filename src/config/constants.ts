@@ -1,4 +1,27 @@
-export const AUTH_COOKIE = 'dt_token';
+export const ROLES = ['admin', 'doctor', 'patient'] as const;
+export type Role = (typeof ROLES)[number];
+
+/** Short-lived JWT (sent on every request) and opaque rotating refresh token. */
+export const ACCESS_COOKIE = 'dt_access';
+export const REFRESH_COOKIE = 'dt_refresh';
+/** Non-secret, readable by JS: lets the frontend skip session calls for visitors. */
+export const SESSION_HINT_COOKIE = 'dt_session';
+
+/**
+ * pending_payment → (paid within the hold) → confirmed → completed
+ *                 ↘ (hold runs out) expired       ↘ cancelled (refunded)
+ */
+export const APPOINTMENT_STATUSES = ['pending_payment', 'confirmed', 'completed', 'cancelled', 'expired'] as const;
+export type AppointmentStatus = (typeof APPOINTMENT_STATUSES)[number];
+
+export const PAYMENT_METHODS = ['card', 'bkash', 'nagad'] as const;
+export type PaymentMethod = (typeof PAYMENT_METHODS)[number];
+export const PAYMENT_STATUSES = ['paid', 'failed', 'refunded'] as const;
+
+/** Booking window patients can see and book into. */
+export const BOOKING_WINDOW_DAYS = 30;
+export const SLOT_LENGTHS = [15, 20, 30, 45, 60] as const;
+export const CURRENCY = 'BDT';
 
 export const PATIENT_CONDITIONS = [
   'Hypertension',

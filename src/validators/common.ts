@@ -35,3 +35,7 @@ export const phone = z
 export const personName = z.string().trim().min(2, 'Name must be at least 2 characters').max(100);
 
 export { optionalTrimmed };
+
+export const paginationOnlySchema = {
+  query: z.object({ page: paginationQuery.page, limit: paginationQuery.limit }),
+};

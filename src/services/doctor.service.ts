@@ -14,6 +14,7 @@ import type {
   UpdateDoctorInput,
 } from '../validators/doctor.validator.js';
 import { setDoctorAccount } from './auth.service.js';
+import { avatarUrl, doctorAccounts } from './avatar.service.js';
 
 const LIST_PROJECTION = 'name specialization hospital phone email consultationFee createdAt updatedAt';
 const DETAIL_PROJECTION = `${LIST_PROJECTION} bio availability`;
@@ -47,12 +48,6 @@ async function patientCountsFor(ids: Types.ObjectId[]): Promise<Map<string, numb
   return new Map(rows.map((r) => [String(r._id), r.count]));
 }
 
-/** Which of these doctors can sign in — one `$in` query for the page. */
-async function accountsFor(ids: Types.ObjectId[]): Promise<Set<string>> {
-  if (ids.length === 0) return new Set();
-  const users = await UserModel.find({ doctor: { $in: ids } }).select('doctor').lean();
-  return new Set(users.map((u) => String(u.doctor)));
-}
 
 function serialize<T extends { _id: Types.ObjectId; nameLower?: unknown; __v?: unknown }>({
   _id,
@@ -75,12 +70,14 @@ export async function listDoctors(q: ListDoctorsQuery) {
     DoctorModel.countDocuments(filter),
   ]);
   const ids = docs.map((d) => d._id);
-  const [counts, accounts] = await Promise.all([patientCountsFor(ids), accountsFor(ids)]);
+  // Patient counts and logins (+ profile pictures) for the whole page: two queries, not 2N.
+  const [counts, accounts] = await Promise.all([patientCountsFor(ids), doctorAccounts(ids)]);
   return {
     data: docs.map((d) => ({
       ...serialize(d),
       patientCount: counts.get(String(d._id)) ?? 0,
       hasAccount: accounts.has(String(d._id)),
+      avatarUrl: accounts.get(String(d._id))?.avatarUrl ?? null,
     })),
     meta: buildPaginationMeta(q.page, q.limit, total),
   };
@@ -100,7 +97,7 @@ export async function getDoctor(id: string) {
         },
       },
     ]),
-    UserModel.findOne({ doctor: doctorId }).select('email lastLoginAt').lean(),
+    UserModel.findOne({ doctor: doctorId }).select('email lastLoginAt avatarUpdatedAt').lean(),
   ]);
   if (!doctor) throw ApiError.notFound('Doctor');
   const s = stats[0];
@@ -110,6 +107,7 @@ export async function getDoctor(id: string) {
     patientsByStatus: (s?.byStatus ?? []).map((r) => ({ status: r._id, count: r.count })),
     patientsByCondition: (s?.byCondition ?? []).map((r) => ({ condition: r._id, count: r.count })),
     hasAccount: Boolean(account),
+    avatarUrl: account ? avatarUrl(account._id, account.avatarUpdatedAt) : null,
     account: account ? { email: account.email, lastLoginAt: account.lastLoginAt ?? null } : null,
   };
 }
@@ -188,11 +186,16 @@ export async function listPublicDoctors(q: ListPublicDoctorsQuery) {
     DoctorModel.find(filter).select(PUBLIC_PROJECTION).sort(sort).skip((q.page - 1) * q.limit).limit(q.limit).lean(),
     DoctorModel.countDocuments(filter),
   ]);
-  return { data: docs.map(serialize), meta: buildPaginationMeta(q.page, q.limit, total) };
+  const accounts = await doctorAccounts(docs.map((d) => d._id));
+  return {
+    data: docs.map((d) => ({ ...serialize(d), avatarUrl: accounts.get(String(d._id))?.avatarUrl ?? null })),
+    meta: buildPaginationMeta(q.page, q.limit, total),
+  };
 }
 
 export async function getPublicDoctor(id: string) {
   const doctor = await DoctorModel.findById(id).select(PUBLIC_PROJECTION).lean();
   if (!doctor) throw ApiError.notFound('Doctor');
-  return serialize(doctor);
+  const accounts = await doctorAccounts([doctor._id]);
+  return { ...serialize(doctor), avatarUrl: accounts.get(String(doctor._id))?.avatarUrl ?? null };
 }

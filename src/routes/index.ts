@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import express, { Router } from 'express';
 import mongoose from 'mongoose';
 import * as appointments from '../controllers/appointment.controller.js';
 import * as auth from '../controllers/auth.controller.js';
@@ -77,6 +77,15 @@ router.post('/auth/logout', auth.logout);
 router.post('/auth/logout-all', signedIn, auth.logoutAll);
 router.get('/auth/me', signedIn, auth.me);
 router.patch('/auth/me', signedIn, validate(updateProfileSchema), auth.updateProfile);
+// Profile picture: raw image body, size-capped before it reaches the handler.
+router.put(
+  '/auth/me/avatar',
+  signedIn,
+  express.raw({ type: ['image/jpeg', 'image/png', 'image/webp'], limit: '300kb' }),
+  auth.uploadAvatar,
+);
+router.delete('/auth/me/avatar', signedIn, auth.deleteAvatar);
+router.get('/avatars/:id', validate(doctorIdSchema), auth.getAvatar);
 router.post('/auth/change-password', signedIn, loginLimiter, validate(changePasswordSchema), auth.changePassword);
 
 // ── Appointments & payments (rows are scoped to the caller's role) ────────

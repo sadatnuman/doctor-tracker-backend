@@ -8,6 +8,7 @@ import { DoctorModel } from '../models/doctor.model.js';
 import { RefreshTokenModel } from '../models/refreshToken.model.js';
 import { UserModel, type UserDocument } from '../models/user.model.js';
 import { ApiError } from '../utils/ApiError.js';
+import { avatarUrl } from './avatar.service.js';
 import type { ChangePasswordInput, RegisterInput, UpdateProfileInput } from '../validators/auth.validator.js';
 
 /**
@@ -229,6 +230,7 @@ export async function getMe(userId: string) {
     age: user.age,
     gender: user.gender,
     doctor: doctor ? { id: String(doctor._id), name: doctor.name, specialization: doctor.specialization, hospital: doctor.hospital } : null,
+    avatarUrl: avatarUrl(user._id, user.avatarUpdatedAt),
     createdAt: user.createdAt,
   };
 }

@@ -42,7 +42,7 @@ function stripOperators(value: unknown): unknown {
 
 /** Defense in depth against NoSQL operator injection (`{ "$gt": "" }`) in bodies. */
 export const sanitizeBody: RequestHandler = (req, _res, next) => {
-  if (req.body && typeof req.body === 'object') req.body = stripOperators(req.body);
+  if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) req.body = stripOperators(req.body);
   next();
 };
 

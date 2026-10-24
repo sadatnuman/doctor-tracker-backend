@@ -1,6 +1,7 @@
 import type { Request, Response } from 'express';
 import { ACCESS_COOKIE, REFRESH_COOKIE } from '../config/constants.js';
 import * as authService from '../services/auth.service.js';
+import * as avatarService from '../services/avatar.service.js';
 
 const meta = (req: Request): authService.RequestMeta => ({ userAgent: req.get('user-agent'), ip: req.ip });
 
@@ -70,4 +71,28 @@ export async function changePassword(req: Request, res: Response) {
   const session = await authService.changePassword(req.user!.id, req.validated.body, meta(req));
   setSessionCookies(res, session);
   res.json(sessionBody(session));
+}
+
+export async function uploadAvatar(req: Request, res: Response) {
+  res.json({ data: await avatarService.setAvatar(req.user!.id, req.body) });
+}
+
+export async function deleteAvatar(req: Request, res: Response) {
+  res.json({ data: await avatarService.removeAvatar(req.user!.id) });
+}
+
+/** Public: profile pictures appear on doctors' public pages. Versioned URLs cache forever. */
+export async function getAvatar(req: Request, res: Response) {
+  const avatar = await avatarService.getAvatar(req.validated.params.id);
+  const etag = `"${avatar.updatedAt?.getTime() ?? 0}"`;
+  res.set({
+    'Content-Type': avatar.contentType,
+    'Cache-Control': req.query.v ? 'public, max-age=31536000, immutable' : 'public, max-age=300',
+    ETag: etag,
+    'X-Content-Type-Options': 'nosniff',
+  });
+  if (req.headers['if-none-match'] === etag) return res.status(304).end();
+  // Lean reads return the driver's Binary wrapper; send the raw bytes.
+  const data = avatar.data as unknown as Buffer | { buffer: Uint8Array };
+  res.send(Buffer.isBuffer(data) ? data : Buffer.from(data.buffer));
 }

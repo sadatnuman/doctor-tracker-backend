@@ -251,3 +251,35 @@ describe('sessions', () => {
     expect(res.status).toBe(403);
   });
 });
+
+describe('profile pictures', () => {
+  // 1×1 transparent PNG.
+  const png = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
+    'base64',
+  );
+
+  it('accepts a real image and serves it with long-lived caching', async () => {
+    const res = await doctorA.put('/api/auth/me/avatar').set('Content-Type', 'image/png').send(png).expect(200);
+    expect(res.body.data.avatarUrl).toMatch(/^\/api\/avatars\/[a-f0-9]{24}\?v=\d+$/);
+
+    const image = await request(app).get(res.body.data.avatarUrl).expect(200);
+    expect(image.headers['content-type']).toBe('image/png');
+    expect(image.headers['cache-control']).toContain('immutable');
+
+    // The doctor's public card now carries the picture.
+    const card = await request(app).get(`/api/public/doctors/${doctorAId}`);
+    expect(card.body.data.avatarUrl).toBe(res.body.data.avatarUrl);
+  });
+
+  it('rejects files whose bytes are not an image, whatever the header says', async () => {
+    const res = await patient1.put('/api/auth/me/avatar').set('Content-Type', 'image/png').send(Buffer.from('<script>alert(1)</script>'));
+    expect(res.status).toBe(400);
+  });
+
+  it('requires sign-in and can be removed', async () => {
+    expect((await request(app).put('/api/auth/me/avatar').set('Content-Type', 'image/png').send(png)).status).toBe(401);
+    await doctorA.delete('/api/auth/me/avatar').expect(200);
+    expect((await doctorA.get('/api/auth/me')).body.data.avatarUrl).toBeNull();
+  });
+});

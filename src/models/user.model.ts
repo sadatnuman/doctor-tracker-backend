@@ -20,6 +20,8 @@ const userSchema = new Schema(
      */
     tokenVersion: { type: Number, default: 0 },
     lastLoginAt: { type: Date },
+    /** Set while the user has a profile picture; also versions its URL. */
+    avatarUpdatedAt: { type: Date },
   },
   {
     timestamps: true,

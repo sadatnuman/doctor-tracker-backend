@@ -5,8 +5,8 @@
 
 | | |
 |---|---|
-| **Live API** | _added after deployment_ — health check at `/api/health` |
-| **Live app** | _added after deployment_ |
+| **Live API** | https://doctor-tracker-api-oapp.onrender.com (health check: [`/api/health`](https://doctor-tracker-api-oapp.onrender.com/api/health)) |
+| **Live app** | https://doctor-tracker-gamma-seven.vercel.app |
 
 **Demo accounts** (created by `npm run seed`; every role signs in through the same endpoint):
 

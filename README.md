@@ -1,19 +1,26 @@
 # Doctor Tracker — API
 
-> REST API for **Doctor Tracker**, a secure admin portal for managing doctors, their patients and caseload analytics.
+> REST API for **Doctor Tracker**: online doctor appointments for patients across Bangladesh, a consulting workspace for doctors, and a roster-and-analytics portal for administrators.
 > Frontend repository: [doctor-tracker-frontend](https://github.com/sadatnuman/doctor-tracker-frontend)
 
 | | |
 |---|---|
 | **Live API** | _added after deployment_ — health check at `/api/health` |
 | **Live app** | _added after deployment_ |
-| **Demo login** | `admin@doctortracker.com` / `Admin@12345` |
+
+**Demo accounts** (created by `npm run seed`; every role signs in through the same endpoint):
+
+| Role | Email | Password |
+|---|---|---|
+| Administrator | `admin@doctortracker.com` | `Admin@12345` |
+| Doctor | `doctor@doctortracker.com` | `Doctor@12345` |
+| Patient | `patient@doctortracker.com` | `Patient@12345` |
 
 ---
 
 ## Description
 
-Hospitals juggle rosters of doctors and the hundreds of patients each one is responsible for, usually across spreadsheets that can't answer simple questions like _"who is overloaded?"_ or _"how many critical admissions did we have this quarter?"_. **Doctor Tracker** gives administrators one secure place to keep the doctor roster current, follow every patient from admission to discharge, and see — at a glance — where demand is growing. This repository is the **standalone Express + MongoDB REST API** behind it: authenticated, validated, index-backed and built so that searching, filtering and paginating thousands of records stays fast.
+Hospitals juggle rosters of doctors and hundreds of patients across spreadsheets, and patients still queue in waiting rooms to get a slot. **Doctor Tracker** connects the three sides: **patients** find a doctor, pick a live time slot and confirm it by paying (card, bKash or Nagad — simulated); **doctors** run their weekly schedule and see paid bookings and their patient list; **administrators** manage the roster, every patient record and live analytics. This repository is the **standalone Express + MongoDB REST API** behind it — role-based, validated, index-backed, with a payment hold that can never double-book a slot.
 
 ## Tech stack
 
@@ -23,9 +30,10 @@ Hospitals juggle rosters of doctors and the hundreds of patients each one is res
 | Language | TypeScript (strict) |
 | Database | **MongoDB Atlas** via Mongoose 9 |
 | Validation | **Zod 4** schemas for body, query and params |
-| Auth | JWT (HS256) in an **httpOnly cookie**, bcrypt password hashing |
-| Security | helmet, strict CORS allow-list, rate limiting, operator-injection stripping |
-| Testing | Vitest + Supertest + mongodb-memory-server |
+| Auth | Short-lived **JWT access token** + **rotating refresh token** (hashed, reuse-detected), both httpOnly cookies; bcrypt |
+| Access control | Roles `admin` / `doctor` / `patient`, route guards + row-level ownership checks |
+| Security | helmet, CORS allow-list, CSRF origin check, rate limits, operator-injection stripping, image sniffing |
+| Testing | Vitest + Supertest + mongodb-memory-server (42 tests) |
 
 ## Setup guide
 
@@ -43,8 +51,9 @@ cp .env.example .env
 #    → set JWT_SECRET to a long random string (must match the frontend's JWT_SECRET)
 #      e.g.  node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"
 
-# 3. Create the admin account + demo data (60 doctors, 3,000 patients)
-npm run seed            # or: npm run seed -- --admin   (admin account only, keeps data)
+# 3. Demo data: 3 demo accounts, 60 doctors (all can sign in), ~3,100 patient records,
+#    120 patient accounts with ~170 paid bookings — all names and hospitals fictional, Bangladeshi
+npm run seed            # or: npm run seed -- --accounts   (refresh the admin account only)
 
 # 4. Run
 npm run dev             # http://localhost:4000  (watch mode)
@@ -52,19 +61,19 @@ npm run dev             # http://localhost:4000  (watch mode)
 
 ### Environment variables
 
-See [`.env.example`](./.env.example).
+See [`.env.example`](./.env.example). The server validates its environment on boot and exits with a clear message if anything is missing.
 
 | Variable | Required | Description |
 |---|---|---|
 | `MONGODB_URI` | ✅ | MongoDB connection string including the database name |
 | `JWT_SECRET` | ✅ | ≥ 32 chars; shared with the frontend so its proxy can verify sessions |
-| `JWT_EXPIRES_IN` | | Session length (default `1d`) |
-| `CLIENT_ORIGIN` | | Comma-separated allowed browser origins (default `http://localhost:3000`) |
+| `ACCESS_TOKEN_TTL` | | Access-token lifetime (default `15m`) |
+| `REFRESH_TOKEN_TTL_DAYS` | | Refresh-token lifetime (default `7`) |
+| `CLIENT_ORIGIN` | | Comma-separated allowed browser origins (CORS + CSRF check) |
 | `COOKIE_SECURE` | | `true` in production (HTTPS) |
-| `PORT` / `NODE_ENV` | | Defaults `4000` / `development` |
-| `SEED_ADMIN_EMAIL` / `SEED_ADMIN_PASSWORD` | | Credentials created by `npm run seed` |
-
-The server validates its environment on boot and exits with a clear message if anything is missing.
+| `CLINIC_TIMEZONE` | | Timezone of doctors' schedules (default `Asia/Dhaka`) |
+| `PAYMENT_HOLD_MINUTES` | | How long an unpaid booking holds its slot (default `5`) |
+| `SEED_*_EMAIL` / `SEED_*_PASSWORD` | | Demo accounts for `admin`, `doctor`, `patient` |
 
 <details>
 <summary><b>Troubleshooting:</b> <code>querySrv ECONNREFUSED _mongodb._tcp…</code></summary>
@@ -91,7 +100,7 @@ Cloud hosts like Render resolve SRV records normally, so production can keep the
 | `npm run build` / `npm start` | Compile to `dist/` and run it |
 | `npm test` | Integration tests against an in-memory MongoDB |
 | `npm run typecheck` | Strict type check |
-| `npm run seed` | Create admin + realistic demo data |
+| `npm run seed` | Demo accounts + realistic Bangladeshi demo data |
 | `npm run explain` | Print the query plan of every list/search/filter query (proves index usage) |
 
 ## System architecture
@@ -99,62 +108,110 @@ Cloud hosts like Render resolve SRV records normally, so production can keep the
 ```mermaid
 flowchart LR
     B[Browser] -->|HTTPS, same-origin /api/*| N[Next.js on Vercel<br/>proxy.ts + rewrites]
-    N -->|REST + auth cookie| A[Express API on Render]
+    N -->|REST + session cookies| A[Express API on Render]
     A -->|Mongoose, pooled| M[(MongoDB Atlas)]
+    A -. every 30 s .-> S[Hold sweeper:<br/>expire unpaid bookings]
 ```
 
 Every request passes through the same pipeline:
 
-`helmet → CORS → compression → JSON body (100 kB cap) → cookie parser → operator sanitizer → rate limiter → authenticate (JWT) → requireRole('admin') → zod validate → controller → service → MongoDB` — and any thrown error lands in one central error handler that returns a consistent shape.
+`helmet → CORS → compression → JSON (100 kB) → cookies → operator sanitizer → CSRF origin check → rate limit → authenticate (JWT) → requireRole(...) → [requireDoctorScope] → zod validate → controller → service (row-level scope) → MongoDB` — and any error lands in one handler that returns a consistent shape.
 
-The code is layered so each part has one job: **routes** declare endpoints and middleware, **controllers** translate HTTP ↔ service calls, **services** own all database logic, **validators** own input rules, **models** own schema + indexes.
+👉 Request lifecycle, data model, every index and its query plan, the session and booking state machines, security model and scaling notes are in **[ARCHITECTURE.md](./ARCHITECTURE.md)**.
 
-👉 The full write-up — request lifecycle, data model, every index and the query plan it produces, aggregation design, security model and scaling notes — is in **[ARCHITECTURE.md](./ARCHITECTURE.md)**.
+## Roles and access
+
+| Capability | Visitor | Patient | Doctor | Admin |
+|---|:-:|:-:|:-:|:-:|
+| Browse doctors, fees and live slots | ✅ | ✅ | ✅ | ✅ |
+| Register (patients only) / sign in | ✅ | — | — | — |
+| Book a slot, pay, cancel own booking | — | ✅ | — | — |
+| See own bookings & receipts | — | ✅ | — | — |
+| Manage own schedule | — | — | ✅ | ✅ (any doctor) |
+| See bookings for own schedule, mark completed | — | — | ✅ | ✅ (all) |
+| Own patient list (add / edit / remove) | — | — | ✅ | ✅ (any doctor) |
+| Roster, doctor logins, all patients, analytics | — | — | — | ✅ |
+| Profile picture, password, sign out everywhere | — | ✅ | ✅ | ✅ |
+
+Ownership is enforced in the data layer too: a doctor querying another doctor's patients gets 403, and an appointment id that isn't yours returns 404 (ids can't be probed).
 
 ## API reference
 
 All endpoints live under `/api` and return JSON. Success: `{ data, meta? }`. Error: `{ error: { code, message, details? } }`.
 
+**Public**
+
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/health` | Liveness + DB status (public) |
-| `POST` | `/auth/login` | Sign in → sets `dt_token` httpOnly cookie (public, rate-limited) |
-| `POST` | `/auth/logout` | Clear the session cookie |
-| `GET` | `/auth/me` | Current user |
-| `GET` | `/doctors` | List doctors — `page, limit, search, specialization, hospital, from, to, sort` |
-| `POST` | `/doctors` | Create a doctor (`name, specialization, hospital, phone, email`) |
-| `GET` | `/doctors/:id` | Doctor profile + caseload breakdown by status and condition |
-| `PATCH` | `/doctors/:id` | Update a doctor |
-| `DELETE` | `/doctors/:id` | Delete (409 if they still have patients, unless `?cascade=true`) |
-| `GET` | `/doctors/:id/patients` | That doctor's patients — same filters as `/patients` |
-| `POST` | `/doctors/:id/patients` | Add a patient under this doctor |
-| `DELETE` | `/doctors/:id/patients/:patientId` | Remove a patient from this doctor's list (404 if it isn't theirs) |
-| `GET` | `/patients` | List patients — `page, limit, search, condition, status, gender, doctor, ageMin, ageMax, from, to, sort` |
-| `POST` | `/patients` | Create a patient (`doctor` id in the body) |
-| `GET` / `PATCH` / `DELETE` | `/patients/:id` | Read / partially update / delete a patient |
-| `GET` | `/stats/overview` | Dashboard aggregates — `from, to, interval=day\|week\|month` |
-| `GET` | `/meta/filters` | Options for filter dropdowns (specializations, hospitals, enums) |
+| `GET` | `/health` | Liveness + DB status |
+| `GET` | `/public/doctors` | Directory (no contact details) — `page, limit, search, specialization, hospital, sort` |
+| `GET` | `/public/doctors/:id` | Public profile: specialty, hospital, fee, bio, schedule, photo |
+| `GET` | `/public/doctors/:id/slots` | Live availability — `from=YYYY-MM-DD, days≤14` (never cached) |
+| `GET` | `/meta/filters` | Specializations, hospitals and enum values |
+| `GET` | `/avatars/:userId` | Profile picture (versioned URL, cached for a year) |
 
-Multi-value filters are comma-separated (`condition=Asthma,Diabetes`). Dates are ISO (`2026-01-31`); a bare `to` date includes the whole day. `limit` is capped at 100 and `sort` is whitelisted per resource.
+**Auth & profile** (one login for every role)
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/auth/register` | Patient sign-up (role is never taken from the client) |
+| `POST` | `/auth/login` | Sign in → access + refresh cookies (rate-limited per IP + email) |
+| `POST` | `/auth/refresh` | Rotate the refresh token, issue a new access token |
+| `POST` | `/auth/logout` · `/auth/logout-all` | End this session · end every session |
+| `GET` / `PATCH` | `/auth/me` | Current user · update name, phone, age, gender |
+| `POST` | `/auth/change-password` | Change password (signs out other devices) |
+| `PUT` / `DELETE` | `/auth/me/avatar` | Upload (raw JPEG/PNG/WebP ≤ 300 kB) · remove profile picture |
+
+**Appointments & payments** (rows scoped to the caller's role)
+
+| Method | Endpoint | Who | Description |
+|---|---|---|---|
+| `GET` | `/appointments` | any | `when=upcoming\|past\|all, status, doctor (admin), page, limit` |
+| `POST` | `/appointments` | patient | Book `{ doctorId, start, reason }` → `pending_payment`, slot held 5 min |
+| `GET` | `/appointments/:id` | owner | Booking + payment + `serverTime` for the countdown |
+| `POST` | `/appointments/:id/pay` | patient | `{ method: card\|bkash\|nagad, … }` → `confirmed` + receipt |
+| `POST` | `/appointments/:id/cancel` | owner | Cancel; refunds a paid booking |
+| `POST` | `/appointments/:id/complete` | doctor/admin | Mark a started visit completed |
+| `GET` | `/payments` | any | Payments scoped like appointments |
+
+**Doctor workspace**
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/me/doctor` · `/me/doctor/overview` | Own profile & caseload · upcoming, completed, revenue this month |
+| `PUT` | `/me/doctor/availability` | Weekly schedule `{ days, start, end, slotMinutes }` |
+| `GET` / `POST` | `/doctors/:id/patients` | Own patient list (admin: any doctor) |
+| `DELETE` | `/doctors/:id/patients/:patientId` | Remove from own list |
+| `GET` / `PATCH` | `/patients/:id` | Read / edit a record in own list (admin: any; only admins reassign) |
+
+**Administration**
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` / `POST` | `/doctors` | List (with patient counts, login + photo) · create (optional initial `password` creates the login) |
+| `GET` / `PATCH` / `DELETE` | `/doctors/:id` | Detail · update (fee, bio, schedule…) · delete (cascade confirmed by `?cascade=true`) |
+| `PUT` | `/doctors/:id/account` | Create or reset a doctor's login (ends their sessions) |
+| `GET` / `POST` | `/patients` | All patient records · create |
+| `DELETE` | `/patients/:id` | Delete a record |
+| `GET` | `/stats/overview` | Dashboard aggregates incl. bookings and revenue — `from, to, interval` |
 
 <details>
-<summary>Example</summary>
+<summary>Example: book and pay</summary>
 
 ```bash
-curl -c jar -X POST http://localhost:4000/api/auth/login \
-  -H 'Content-Type: application/json' \
-  -d '{"email":"admin@doctortracker.com","password":"Admin@12345"}'
+curl -c jar -X POST localhost:4000/api/auth/login -H 'Content-Type: application/json' \
+  -d '{"email":"patient@doctortracker.com","password":"Patient@12345"}'
 
-curl -b jar 'http://localhost:4000/api/patients?condition=Asthma,Diabetes&status=Critical&from=2026-01-01&limit=5'
-```
+DOCTOR=$(curl -s 'localhost:4000/api/public/doctors?search=ayesha' | jq -r '.data[0].id')
+SLOT=$(curl -s "localhost:4000/api/public/doctors/$DOCTOR/slots" | jq -r '[.data.days[].slots[] | select(.available)][0].start')
 
-```json
-{
-  "data": [{ "id": "…", "name": "Ayden Terry", "age": 46, "condition": "Diabetes", "status": "Critical",
-             "admissionDate": "2026-10-23T05:41:09.778Z",
-             "doctor": { "id": "…", "name": "Dr. Schuyler Bogisich", "specialization": "Gastroenterology" } }],
-  "meta": { "page": 1, "limit": 5, "total": 41, "totalPages": 9, "hasNextPage": true, "hasPrevPage": false }
-}
+curl -b jar -X POST localhost:4000/api/appointments -H 'Content-Type: application/json' \
+  -d "{\"doctorId\":\"$DOCTOR\",\"start\":\"$SLOT\",\"reason\":\"Fever and cough\"}"
+# → { "data": { "id": "…", "status": "pending_payment", "holdExpiresAt": "…+5 min", "fee": 800 } }
+
+curl -b jar -X POST localhost:4000/api/appointments/<id>/pay -H 'Content-Type: application/json' \
+  -d '{"method":"bkash","walletNumber":"01712345678","pin":"12345"}'
+# → { "data": { "status": "confirmed", "payment": { "status": "paid", "instrument": "bKash •••• 5678", "transactionId": "TXN-…" } } }
 ```
 </details>
 
@@ -162,27 +219,23 @@ curl -b jar 'http://localhost:4000/api/patients?condition=Asthma,Diabetes&status
 
 ### 1. Index-backed prefix search instead of `$regex /term/i` or a `$text` index
 
-Search is the most-used feature and the easiest one to make slow. The usual options both have a catch:
+- **Case-insensitive regex (`/jo/i`)** cannot use a B-tree index efficiently — MongoDB examines every key, so cost grows with the collection.
+- **A `$text` index** matches whole stemmed words only: typing `"Jo"` would not find `"John"`, which feels broken in search-as-you-type.
 
-- **Case-insensitive regex (`/jo/i`)** cannot use a B-tree index efficiently — MongoDB has to examine every key, so cost grows linearly with the collection.
-- **A `$text` index** is fast, but matches whole stemmed words only: typing `"Jo"` would not find `"John"`, which feels broken in a search-as-you-type box.
-
-**What we do:** each document stores a normalized `nameLower` copy (kept in sync by a Mongoose plugin on save *and* on update), and search runs an **anchored, case-sensitive prefix regex** (`^jo`) against it, OR-ed with the same prefix on the (already lower-cased) email. An anchored prefix compiles to a bounded **index range scan**. Because every `$or` branch has its own index, MongoDB plans it as `OR ← IXSCAN(nameLower_1) + IXSCAN(email_1)` instead of falling back to a collection scan. User input is regex-escaped first.
-
-Measured with `npm run explain` on 3,000 patients: a search returning 10 rows examines **49 documents in ~3 ms**, versus a full collection scan of all 3,000 with the naïve regex. The trade-off — prefix-only matching ("hopper" won't find "Grace Hopper") — is the behaviour people expect from a name search, and the path to fuzzy/infix search later is Atlas Search, not a slower regex.
+**What we do:** each document stores a normalized `nameLower` (kept in sync by a Mongoose plugin on save *and* update) and search runs an **anchored, case-sensitive prefix regex** (`^jo`), OR-ed with the same prefix on the lower-cased email. Anchored prefixes compile to bounded **index range scans**, and since every `$or` branch has its own index MongoDB plans `OR ← IXSCAN(nameLower_1) + IXSCAN(email_1)`. Measured with `npm run explain` on 3,000 patients: **49 documents examined in ~1–3 ms** for a 10-row page, versus all 3,000 for the naïve regex. Fuzzy/infix search would move to Atlas Search, not to a slower regex.
 
 ### 2. Aggregation strategy: one `$facet` pass, no denormalized counters
 
-The dashboard needs totals, a time series, four breakdowns and a top-10 — naïvely ~10 queries, or worse, per-doctor counts (N+1).
+- **Dashboard** — one `$match` on the indexed `admissionDate` range feeds a single **`$facet`** (timeline via `$dateTrunc`, condition/status/gender/age breakdowns, top-10 doctors with the `$lookup` *after* `$sort + $limit`), in parallel with index-backed counts for bookings and collected revenue. Empty time buckets are filled server-side.
+- **Doctor list patient counts** — instead of a `patientCount` field that must stay in sync on every write, **one** `$match { doctor: { $in: pageIds } } → $group` per page. Always correct, always cheap.
 
-- **Dashboard** — a single `$match` on the indexed `admissionDate` range feeds one **`$facet`** that computes the timeline (`$dateTrunc` by day/week/month), condition/status/gender/age (`$bucket`) breakdowns and the top-10 doctors in one pass over the data. The `$lookup` for doctor names runs **after** `$sort + $limit 10`, so it joins 10 documents, not 3,000. Totals use `estimatedDocumentCount()` (metadata, O(1)). Everything runs in parallel with `Promise.all`, and empty buckets are filled server-side so charts never show gaps.
-- **Doctor list "patients" column** — instead of storing a `patientCount` on each doctor (which must be kept in sync on every create/delete/reassign and drifts the moment one write fails), the service runs **one** grouped query for the current page: `$match { doctor: { $in: pageIds } } → $group`. That's at most 100 ids against the `{ doctor, admissionDate }` index — always correct, always cheap.
+### 3. Sessions: short access token + rotating, reuse-detecting refresh token
 
-The rule of thumb applied: derive aggregates from the source of truth with indexed, page-bounded queries; only denormalize when measurement says you must.
+A single long-lived JWT can't be revoked. Instead: a **15-minute JWT** (role + doctor link, verified with no DB hit) and a **7-day opaque refresh token** stored only as a **SHA-256 hash**. Every `/auth/refresh` **rotates** the refresh token; presenting an already-rotated token means a copy leaked, so the whole token **family is revoked** (theft detection). Two tabs refreshing at once get a 30-second grace (`REFRESH_RACE`) instead of a false alarm. Password changes and "sign out everywhere" bump a `tokenVersion`, ending every other session within one access-token lifetime. Both tokens live in **httpOnly, SameSite=Lax, Secure** cookies behind the frontend's same-origin proxy, plus a CSRF origin check on writes.
 
-### 3. (Bonus) httpOnly JWT cookie behind a same-origin proxy
+### 4. Payment holds that can't double-book
 
-Tokens in `localStorage` are readable by any injected script. The API instead sets the JWT in an **`httpOnly`, `SameSite=Lax`, `Secure`** cookie. The frontend calls `/api/*` on its *own* origin and Next.js rewrites that to this server, so the cookie is first-party — no `SameSite=None`, no third-party-cookie blocking, and the frontend proxy can verify it before rendering a page. The API still verifies the token on every request and also accepts `Authorization: Bearer` for non-browser clients.
+Booking creates a `pending_payment` appointment with `holdExpiresAt = now + 5 min` and `holdsSlot: true`. A **partial unique index** on `{ doctor, start }` *where `holdsSlot` is true* makes a second booking of the same slot fail atomically in the database (409 `SLOT_TAKEN`) — even if two patients press "Book" in the same millisecond. Payment confirms with a **conditional update** (`status = pending_payment AND holdExpiresAt > now`), so a payment that arrives a moment too late can't confirm a released slot. Lapsed holds are released **lazily** before every slot read/booking (indexed `{ status, holdExpiresAt }` update) and by a 30-second sweeper, flipping `holdsSlot` off so the slot is instantly bookable by anyone. A confirmed booking opens (or reuses) the patient's record in that doctor's list.
 
 ## Testing
 
@@ -190,34 +243,35 @@ Tokens in `localStorage` are readable by any injected script. The API instead se
 npm test
 ```
 
-16 integration tests spin up an in-memory MongoDB and exercise the real HTTP stack: auth (401s, generic credential errors, cookie flags, Bearer support), validation (field-level 400s, malformed ids, unknown enum values), conflicts (409 on duplicate email / deleting a doctor with patients), search + filter + pagination metadata, partial updates not resetting fields, doctor-scoped deletes, and the dashboard aggregation shape.
+42 integration tests over the real HTTP stack and an in-memory MongoDB: auth and validation; RBAC (patients blocked from admin routes, doctors limited to their own patients); booking (5-minute hold, same-slot conflict, off-schedule times, only the booking patient can pay, declined card keeps the hold, payment confirms and adds the patient to the doctor's list, expired hold releases the slot to someone else, refund on cancel); sessions (refresh rotation, reuse detection, sign-out-everywhere on password change, CSRF origin check); profile pictures (byte sniffing rejects non-images, cache headers); search, filters, pagination and dashboard aggregates.
 
 ## Project structure
 
 ```
 src/
-├─ config/        env (zod-validated), db connection, shared constants
-├─ models/        Mongoose schemas + indexes, name-normalization plugin
-├─ validators/    zod schemas per resource (body / query / params)
-├─ middlewares/   authenticate, requireRole, validate, rate limits, sanitizer, error handler
-├─ services/      all database logic (auth, doctors, patients, stats, meta)
+├─ config/        env (zod-validated), db connection, roles/statuses/constants
+├─ models/        user, doctor (+ schedule), patient, appointment, payment, refreshToken, avatar
+├─ validators/    zod schemas per resource
+├─ middlewares/   authenticate, requireRole, requireDoctorScope, verifyOrigin, validate, rate limits, errors
+├─ services/      auth, doctors, patients, slots, appointments & payments, stats, avatars
 ├─ controllers/   thin HTTP layer
-├─ routes/        REST route table
+├─ routes/        role-annotated REST route table
+├─ utils/         query helpers, timezone helpers
 ├─ scripts/       seed + query-plan explain
 ├─ app.ts         Express app factory (used by server and tests)
-└─ server.ts      boot + graceful shutdown
+└─ server.ts      boot, hold sweeper, graceful shutdown
 tests/            API integration tests
 ```
 
 ## Deployment
 
-The API is deployed on **Render** (free web service) from the `main` branch using [`render.yaml`](./render.yaml): build `npm ci --include=dev && npm run build`, start `npm start`, health check `/api/health`. Set `MONGODB_URI`, `JWT_SECRET` and `CLIENT_ORIGIN` (the Vercel URL) in the Render dashboard, and allow Render's outbound traffic in Atlas → Network Access. In production, indexes are synced explicitly on boot (`autoIndex` is off).
+Deployed on **Render** (free web service, Singapore — closest to the Atlas cluster in Mumbai) from `main` using [`render.yaml`](./render.yaml): build `npm ci --include=dev && npm run build`, start `npm start`, health check `/api/health`. Set `MONGODB_URI`, `JWT_SECRET` and `CLIENT_ORIGIN` (the Vercel URL) in the dashboard. Indexes are synced explicitly on boot in production.
 
-> Free Render instances sleep after ~15 minutes idle; the first request afterwards takes up to a minute while it wakes. The frontend shows a "waking the server" notice during that wait.
+> Free Render instances sleep after ~15 minutes idle; the first request afterwards takes up to a minute. The frontend shows a "waking the server" notice and its public pages are served from cache meanwhile.
 
 ## Visual evidence
 
-Desktop and mobile screenshots of the full application are in the frontend repository's README: **[doctor-tracker-frontend → Visual evidence](https://github.com/sadatnuman/doctor-tracker-frontend#visual-evidence)**.
+Desktop and mobile screenshots: **[doctor-tracker-frontend → Visual evidence](https://github.com/sadatnuman/doctor-tracker-frontend#visual-evidence)**.
 
 ## Branching
 

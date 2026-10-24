@@ -1,20 +1,22 @@
 # Architecture — Doctor Tracker API
 
-This document explains how the API is put together and why. For setup and the endpoint list see [README.md](./README.md).
+How the API is put together and why. For setup and the endpoint list see [README.md](./README.md).
 
 - [1. System context](#1-system-context)
 - [2. Layered design](#2-layered-design)
 - [3. Request lifecycle](#3-request-lifecycle)
 - [4. Data model](#4-data-model)
-- [5. Indexing strategy](#5-indexing-strategy)
-- [6. Query patterns](#6-query-patterns)
-- [7. Dashboard aggregation](#7-dashboard-aggregation)
-- [8. Authentication & authorization](#8-authentication--authorization)
-- [9. Validation & error handling](#9-validation--error-handling)
-- [10. Security controls](#10-security-controls)
-- [11. Testing strategy](#11-testing-strategy)
-- [12. Deployment](#12-deployment)
-- [13. Scalability considerations](#13-scalability-considerations)
+- [5. Roles & access control](#5-roles--access-control)
+- [6. Sessions](#6-sessions)
+- [7. Scheduling, booking & payment](#7-scheduling-booking--payment)
+- [8. Indexing strategy](#8-indexing-strategy)
+- [9. Query patterns](#9-query-patterns)
+- [10. Dashboard aggregation](#10-dashboard-aggregation)
+- [11. Validation & error handling](#11-validation--error-handling)
+- [12. Security controls](#12-security-controls)
+- [13. Testing strategy](#13-testing-strategy)
+- [14. Deployment](#14-deployment)
+- [15. Scalability considerations](#15-scalability-considerations)
 
 ---
 
@@ -26,135 +28,234 @@ flowchart LR
       B[Browser]
     end
     subgraph Vercel
-      P[proxy.ts<br/>JWT check before render]
+      P[proxy.ts<br/>locale + role check]
       R[Rewrites<br/>/api/* → API]
-      UI[Next.js pages<br/>TanStack Query]
+      UI[Next.js pages]
     end
     subgraph Render
       A[Express API]
+      SW[Hold sweeper<br/>every 30 s]
     end
     subgraph Atlas
       D[(MongoDB<br/>replica set)]
     end
     B --> P --> UI
-    B -->|fetch /api/*| R -->|HTTPS + cookie| A -->|Mongoose pool| D
+    B -->|fetch /api/*| R -->|HTTPS + cookies| A -->|Mongoose pool| D
+    UI -->|server-side reads for public pages| A
+    SW --> D
 ```
 
-The frontend and API are separate deployments. The browser never calls the API host directly: it calls `/api/*` on the frontend origin and Next.js rewrites those requests to Render. That single decision makes the auth cookie first-party (see [§8](#8-authentication--authorization)).
+The frontend and API are separate deployments. Browsers never call the API host directly: they call `/api/*` on the frontend origin and Next.js rewrites to Render, which makes the session cookies first-party (see [§6](#6-sessions)). The frontend's server also reads the public endpoints to prerender indexable pages.
 
 ## 2. Layered design
 
 ```
-routes/        → which URL, which middleware chain, which controller
-controllers/   → read req.validated, call a service, shape the HTTP response
-services/      → every database read/write and business rule
+routes/        → URL, middleware chain and required role, declared side by side
+controllers/   → read req.validated + req.user, call a service, shape the response
+services/      → all database logic, business rules and row-level scoping
 validators/    → zod schemas: the contract for body / query / params
-models/        → Mongoose schemas, indexes, normalization plugin
-middlewares/   → cross-cutting concerns (auth, validation, limits, errors)
-config/        → env (validated at boot), DB connection, constants
+models/        → Mongoose schemas and indexes
+middlewares/   → authentication, role guards, ownership guards, CSRF, limits, errors
+config/        → env (validated at boot), DB connection, roles / statuses / constants
+utils/         → query helpers and timezone helpers
 ```
 
-Rules the code follows:
-
-- **Controllers never touch Mongoose.** They are 3–5 lines each, so HTTP concerns (status codes, `Location` headers, cache headers) are easy to audit.
-- **Services never see `req`/`res`.** They take typed inputs and return plain objects, which makes them reusable — `listPatients` serves both `/patients` and `/doctors/:id/patients`.
-- **Services return serialized DTOs** (`id` instead of `_id`, no `__v`, no internal `nameLower`), using `.lean()` reads so no Mongoose document hydration cost is paid on list endpoints.
-- **`createApp()` is a factory** that doesn't connect to the database, so tests mount the exact production app against an in-memory MongoDB.
+- **Controllers never touch Mongoose; services never see `req`/`res`.** Services take the caller (`AuthUser`) where scoping matters, so the same `listAppointments` serves patients, doctors and admins with different filters.
+- **Lean reads + explicit DTOs**: `id` instead of `_id`, no internal fields (`nameLower`, `holdsSlot`, password hashes, token versions).
+- **`createApp()` is a factory** without a DB connection, so tests mount the production app against an in-memory MongoDB.
 
 ## 3. Request lifecycle
 
 ```mermaid
 sequenceDiagram
     participant C as Client
-    participant MW as Middleware chain
+    participant MW as Middleware
+    participant G as Guards
     participant V as validate(zod)
-    participant Ctl as Controller
     participant S as Service
     participant DB as MongoDB
-    C->>MW: GET /api/patients?condition=Asthma&page=2
-    MW->>MW: helmet · CORS · compression · json(100kb) · cookies · sanitize · rate limit
-    MW->>MW: authenticate (verify JWT) → requireRole('admin')
-    MW->>V: parse + coerce query
-    V-->>Ctl: req.validated.query (typed, defaults applied)
-    Ctl->>S: listPatients(query)
-    par in parallel
-      S->>DB: find(filter).sort().skip().limit().populate().lean()
-      S->>DB: countDocuments(filter)
-    end
-    DB-->>S: rows + total
-    S-->>Ctl: { data, meta }
-    Ctl-->>C: 200 JSON
-    Note over MW,Ctl: Any throw → errorHandler → { error: { code, message, details } }
+    C->>MW: POST /api/appointments/:id/pay
+    MW->>MW: helmet · CORS · json(100kb) · cookies · sanitize · verifyOrigin · rate limit
+    MW->>G: authenticate (verify access JWT) → requireRole('patient')
+    G->>V: parse params + discriminated payment body
+    V->>S: payForAppointment(user, id, input)
+    S->>DB: release lapsed hold for this id
+    S->>DB: findOne({ _id, patientUser: user.id })  ← row-level scope
+    S->>DB: conditional update: pending_payment ∧ hold live → confirmed
+    S->>DB: insert Payment · upsert Patient record
+    S-->>C: 200 booking + receipt
+    Note over MW,S: Any throw → errorHandler → { error: { code, message, details } }
 ```
 
-Express 5 forwards rejected promises from async handlers to the error middleware natively, so there is no `try/catch` or `asyncHandler` wrapper anywhere.
+Express 5 forwards rejected promises to the error middleware natively — no `try/catch` wrappers.
 
 ## 4. Data model
 
 ```mermaid
 erDiagram
+    USER ||--o| DOCTOR : "signs in as (role doctor)"
+    USER ||--o{ APPOINTMENT : "books (role patient)"
+    USER ||--o{ REFRESH_TOKEN : "has sessions"
+    USER ||--o| AVATAR : "has picture"
+    DOCTOR ||--o{ PATIENT : "is responsible for"
+    DOCTOR ||--o{ APPOINTMENT : "consults"
+    APPOINTMENT ||--o| PAYMENT : "is paid by"
+    APPOINTMENT }o--o| PATIENT : "links to record"
     USER {
-      ObjectId _id
-      string name
       string email UK
       string password "bcrypt, select:false"
-      string role "admin"
+      enum role "admin | doctor | patient"
+      ObjectId doctor "unique, doctors only"
+      int tokenVersion
+      date avatarUpdatedAt
     }
-    DOCTOR ||--o{ PATIENT : "is responsible for"
     DOCTOR {
-      ObjectId _id
       string name
       string nameLower "search key"
       string specialization
       string hospital
-      string phone
-      string email UK
-      date createdAt
+      int consultationFee "BDT"
+      object availability "days, start, end, slotMinutes"
     }
     PATIENT {
-      ObjectId _id
       string name
-      string nameLower "search key"
-      int age
-      enum gender
-      string phone
-      string email "optional"
       enum condition
-      enum status "Critical | Active | Recovered | Discharged"
+      enum status
       date admissionDate
-      string notes
       ObjectId doctor FK
+      ObjectId user "online bookings"
+    }
+    APPOINTMENT {
+      date start
+      date end
+      enum status "pending_payment | confirmed | completed | cancelled | expired"
+      date holdExpiresAt
+      bool holdsSlot
+      int fee "snapshot"
+    }
+    PAYMENT {
+      int amount
+      enum method "card | bkash | nagad"
+      string instrument "masked"
+      enum status "paid | failed | refunded"
+      string transactionId UK
+    }
+    REFRESH_TOKEN {
+      string tokenHash UK "SHA-256"
+      string family
+      int tokenVersion
+      date expiresAt "TTL"
+      date revokedAt
+    }
+    AVATAR {
+      binary data "≤ 300 kB"
+      string contentType "sniffed"
     }
 ```
 
-- **Reference, not embed.** Patients reference their doctor (`doctor: ObjectId`). Embedding patients inside doctors would hit the 16 MB document limit for busy doctors, make "all patients" queries awkward, and turn every patient edit into a rewrite of the doctor document.
-- **Enums for `condition` and `status`** keep filter values clean and make the dashboard breakdowns meaningful; they are enforced both by zod (400 with a field message) and by the schema.
-- **`nameLower`** is a derived field kept in sync by `nameLowerPlugin` on `validate` (create/save) and on `findOneAndUpdate`/`updateOne` hooks, so no code path can forget it. It is `select: false` and stripped from JSON.
+Key choices:
 
-## 5. Indexing strategy
+- **One login per roster entry.** A doctor's `User` points at its `Doctor` document (`doctor`, partial unique index), so the access token carries `doctorId` and ownership checks need no lookup.
+- **Patients are both accounts and records.** A *patient account* books appointments; a *patient record* is a clinical entry in one doctor's list. A paid booking **upserts** the record for `(user, doctor)` (partial unique index), so repeat visits reuse it.
+- **Fee snapshot.** The appointment stores the fee at booking time; later fee changes don't rewrite history.
+- **Avatars outside the user document**, in their own collection: free-tier disks are ephemeral, and user reads never carry image bytes.
 
-Indexes follow the **ESR rule** (Equality → Sort → Range): the equality field first, then the default sort field, so the same index serves the filter, the sort and the pagination window without an in-memory sort.
+## 5. Roles & access control
+
+Three layers, from coarse to fine:
+
+1. **Route guards** — every route in `routes/index.ts` is annotated with who may call it: `public`, `signedIn`, `admin`, `doctor`, `patient`, or `adminOrOwningDoctor`.
+2. **Ownership guards** — `requireDoctorScope('id')` lets admins through and a doctor only when `:id` is their own roster entry (403 otherwise).
+3. **Row-level scoping in services** — appointment and payment queries always merge a scope filter (`{}` for admins, `{ doctor: user.doctorId }`, `{ patientUser: user.id }`); patient-record updates by doctors are filtered by `{ doctor: user.doctorId }`. A row outside the scope looks like **404**, so ids can't be probed.
+
+Other rules: only admins reassign a patient to another doctor; only patients book and pay; registration never accepts `role` (zod strips unknown keys and the service forces `patient`).
+
+## 6. Sessions
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant A as API
+    participant DB as MongoDB
+    B->>A: POST /auth/login
+    A->>DB: verify bcrypt · insert RefreshToken{hash, family F, tokenVersion}
+    A-->>B: Set-Cookie dt_access (JWT 15 min) · dt_refresh (random, 7 d) · dt_session=1
+    Note over B,A: …15 minutes later, a request returns 401 TOKEN_EXPIRED
+    B->>A: POST /auth/refresh (dt_refresh R1)
+    A->>DB: find hash(R1): live → revoke R1, insert R2 (same family F)
+    A-->>B: new dt_access + dt_refresh R2
+    Note over B,A: Someone replays the stolen R1
+    B->>A: POST /auth/refresh (R1)
+    A->>DB: R1 already rotated → revoke the whole family F
+    A-->>B: 401 SESSION_REUSED (R2 is dead too)
+```
+
+- **Access token**: HS256 JWT with `iss`, `aud`, `sub`, `role`, `doctorId`, `typ: access`; verified statelessly on every request.
+- **Refresh token**: 256-bit random, stored only as a **SHA-256 hash** with its family, user agent and IP; TTL index deletes expired rows.
+- **Rotation + reuse detection** as above; a **30-second grace** returns `REFRESH_RACE` (no revocation) when two tabs refresh at once — the frontend retries with the cookie the winning tab already received.
+- **Revocation**: logout revokes the family; password change and "sign out everywhere" bump `tokenVersion` and revoke all families, so other devices drop off within one access-token lifetime.
+- **Cookies**: `httpOnly`, `SameSite=Lax`, `Secure` in production, path `/`. A third cookie, `dt_session=1`, is readable by JavaScript and holds no secret: it only lets the frontend skip session calls for visitors.
+- **Timing-safe login**: unknown emails still run a bcrypt comparison, and both failure modes return the same message.
+
+## 7. Scheduling, booking & payment
+
+### Schedules and slots
+
+A doctor's `availability` is wall-clock time in the clinic timezone (`Asia/Dhaka`): consulting days (0 = Sunday), start, end and slot length (15–60 min). `slot.service` turns it into UTC instants per calendar date with a small `Intl`-based timezone helper (no date library), drops past slots, and marks a slot taken when a **confirmed** booking or a **still-live hold** exists — one indexed range query per request on `{ doctor, start }`. The booking window is 30 days.
+
+### Booking state machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending_payment: patient books (slot held, holdExpiresAt = now + 5 min)
+    pending_payment --> confirmed: paid while hold is live
+    pending_payment --> expired: hold lapses (lazy release + 30 s sweeper)
+    pending_payment --> cancelled: patient releases the slot
+    confirmed --> completed: doctor/admin, once the visit has started
+    confirmed --> cancelled: patient (before start) · doctor · admin — payment refunded
+    expired --> [*]
+    cancelled --> [*]
+    completed --> [*]
+```
+
+Guarantees:
+
+- **No double booking.** `holdsSlot` is `true` only for `pending_payment` and `confirmed`. A **partial unique index** `{ doctor: 1, start: 1 }` with `partialFilterExpression: { holdsSlot: true }` lets MongoDB reject a second live booking of the same slot atomically, under any concurrency.
+- **Released means released.** Before any slot read or booking, lapsed holds are flipped to `expired` with `holdsSlot: false` (indexed `{ status, holdExpiresAt }`); the sweeper does the same every 30 seconds. The slot is immediately bookable by everyone.
+- **One open hold per patient.** A patient with an unpaid booking is pointed back to it (`409 OPEN_HOLD`) instead of grabbing several slots.
+- **Late payments can't confirm.** Confirmation is a conditional `findOneAndUpdate` on `status = pending_payment ∧ holdExpiresAt > now`.
+- **Published slots only.** A booking's `start` must match one of the doctor's generated slot starts.
+
+### Simulated payments
+
+`chargeInstrument` behaves like a gateway without moving money: Luhn check, expiry check, card brand detection and a deterministic **decline for `4000 0000 0000 0002`**; bKash/Nagad accept 11-digit BD mobile numbers with a 4–6 digit PIN. Every attempt is stored (`paid` or `failed` with a reason) with a unique transaction id and a **masked instrument** (`Visa •••• 4242`) — full numbers and PINs are never stored. A declined attempt keeps the hold so the patient can retry. Cancelling a paid booking marks the payment `refunded`.
+
+## 8. Indexing strategy
+
+Indexes follow **ESR** (Equality → Sort → Range) so one index serves filter, sort and pagination.
 
 | Collection | Index | Serves |
 |---|---|---|
 | doctors | `{ email: 1 }` unique | uniqueness, email-prefix search |
-| doctors | `{ nameLower: 1 }` | name-prefix search |
-| doctors | `{ specialization: 1, createdAt: -1 }` | filter by specialization, newest first |
-| doctors | `{ hospital: 1, createdAt: -1 }` | filter by hospital, newest first |
-| doctors | `{ createdAt: -1 }` | default list order, "date added" range |
-| patients | `{ doctor: 1, admissionDate: -1 }` | a doctor's patient list; per-page patient counts |
-| patients | `{ condition: 1, admissionDate: -1 }` | condition filter + default sort |
-| patients | `{ status: 1, admissionDate: -1 }` | status filter + default sort |
-| patients | `{ admissionDate: -1 }` | default list order, date ranges, dashboard `$match` |
-| patients | `{ nameLower: 1 }` | name-prefix search |
-| patients | `{ email: 1 }` sparse | email-prefix search (every `$or` branch must be indexed) |
-| users | `{ email: 1 }` unique | login lookup |
+| doctors | `{ nameLower: 1 }` | name-prefix search (admin + public directory) |
+| doctors | `{ specialization: 1, createdAt: -1 }` · `{ hospital: 1, createdAt: -1 }` · `{ createdAt: -1 }` | filters + default sort |
+| patients | `{ doctor: 1, admissionDate: -1 }` | a doctor's list; per-page patient counts |
+| patients | `{ condition: 1, admissionDate: -1 }` · `{ status: 1, admissionDate: -1 }` · `{ admissionDate: -1 }` | filters, date ranges, dashboard |
+| patients | `{ nameLower: 1 }` · `{ email: 1 }` sparse | search (every `$or` branch indexed) |
+| patients | `{ user: 1, doctor: 1 }` unique, partial | one record per (account, doctor) |
+| appointments | `{ doctor: 1, start: 1 }` unique, partial (`holdsSlot: true`) | **double-booking guard** |
+| appointments | `{ doctor: 1, start: -1 }` · `{ patientUser: 1, start: -1 }` · `{ status: 1, start: -1 }` | schedules, "my appointments", admin list |
+| appointments | `{ status: 1, holdExpiresAt: 1 }` | hold sweeper |
+| payments | `{ transactionId: 1 }` unique · `{ doctor: 1, paidAt: -1 }` · `{ status: 1, paidAt: -1 }` · `{ patientUser: 1, createdAt: -1 }` | revenue, receipts |
+| users | `{ email: 1 }` unique · `{ doctor: 1 }` unique partial · `{ role: 1, createdAt: -1 }` | login, doctor link |
+| refreshtokens | `{ tokenHash: 1 }` unique · `{ family: 1 }` · `{ user: 1 }` · `{ expiresAt: 1 }` TTL | rotation, revocation, cleanup |
+| avatars | `{ user: 1 }` unique | one picture per user |
 
-Index builds: `autoIndex` is on in development and off in production, where `syncIndexes()` runs once at boot — so production never builds indexes implicitly in the middle of traffic, and stale indexes are dropped.
+`autoIndex` is on in development and off in production, where `syncIndexes()` runs once at boot.
 
 ### Verified query plans
 
-`npm run explain` prints the winning plan for each hot query. Output against the seeded Atlas cluster (60 doctors, 3,000 patients):
+`npm run explain` against the seeded Atlas cluster:
 
 ```
 Doctors: default list (newest first)       IXSCAN(createdAt_-1)                        docsExamined=10  returned=10
@@ -167,139 +268,54 @@ Patients: admission date range             IXSCAN(admissionDate_-1)             
 Patients: search "jo"                      OR ← IXSCAN(nameLower_1) + IXSCAN(email_1)  docsExamined=49  returned=10
 ```
 
-No query performs a collection scan, and paginated lists examine exactly the documents they return.
+## 9. Query patterns
 
-## 6. Query patterns
+- **Lists**: `find(filter).select().sort({ field, _id }).skip().limit().lean()` in parallel with `countDocuments(filter)`; `limit ≤ 100`, sort fields whitelisted, `_id` tie-breaker for stable pages.
+- **Joins without N+1**: patient rows use one `populate` `$in` query per page; doctor rows get patient counts from one `$group` and login/photo status from one `users` `$in` query.
+- **Search**: anchored prefix regex on normalized fields; the public directory also matches the name after the "Dr." title (`$in` of two anchored prefixes, still index bounds).
+- **Writes**: partial `$set` with `runValidators`; doctor-scoped deletes filter by `{ _id, doctor }`; deleting a doctor cascades to their login, sessions, patients and appointments only after an explicit confirmation.
 
-**Lists** (`/doctors`, `/patients`, `/doctors/:id/patients`)
+## 10. Dashboard aggregation
 
-```ts
-const [rows, total] = await Promise.all([
-  Model.find(filter).select(projection).sort({ [field]: dir, _id: dir })
-       .skip((page - 1) * limit).limit(limit).lean(),
-  Model.countDocuments(filter),
-]);
-```
+`GET /stats/overview` runs in parallel: O(1) `estimatedDocumentCount` totals, an index-range count for the previous period (trend %), new doctors in range, a `$group` of **appointments by status** in range, a `$group` sum of **paid revenue** in range, specialization counts, and one **`$facet`** over patients in range (timeline with `$dateTrunc`, condition/status/gender, `$bucket` age groups, top-10 doctors with the `$lookup` after `$limit`). Missing time buckets are zero-filled; responses carry `Cache-Control: private, max-age=30`. The doctor overview (`/me/doctor/overview`) uses the same approach scoped to one doctor.
 
-- `limit` is capped at 100; `sort` comes from a per-resource whitelist (no sorting on unindexed fields from user input).
-- `_id` is appended to every sort as a tie-breaker so pages are stable when many rows share a timestamp.
-- Patient rows need their doctor's name: `.populate('doctor', 'name specialization hospital')` issues **one** `$in` query for the whole page.
-- Doctor rows need a patient count: **one** `$match { doctor: { $in: pageIds } } → $group` for the whole page (covered by the `{ doctor, admissionDate }` index). This avoids both N+1 queries and a denormalized counter that would need transactional upkeep.
+## 11. Validation & error handling
 
-**Search** is an anchored, case-sensitive prefix regex on the normalized field (`^jo` on `nameLower`), OR-ed with the email prefix. Anchored prefixes compile to index bounds; user input is regex-escaped. Trade-off and alternatives are discussed in the README's technical decisions.
+Zod validates and coerces every input onto `req.validated` (Express 5's `req.query` is read-only). Payment bodies are a **discriminated union** on `method`. One error middleware maps failures to a consistent shape: `VALIDATION_ERROR` (400, field `details`), `UNAUTHORIZED` / `TOKEN_EXPIRED` (401), `FORBIDDEN` (403), `NOT_FOUND` (404), `CONFLICT` (409, with `details.reason` such as `SLOT_TAKEN`, `OPEN_HOLD`, `HOLD_EXPIRED`), `PAYMENT_DECLINED` (402), `PAYLOAD_TOO_LARGE` (413), `TOO_MANY_REQUESTS` (429), `INTERNAL_ERROR` (500; stack only outside production). The frontend maps codes to messages in Bangla or English.
 
-**Filters** are plain equality or `$in` on enum fields, and `$gte/$lte` on dates. A bare `to` date (`2026-01-31`) is widened to the end of that day so the range is inclusive the way people expect.
+Zod 4 applies defaults inside `.partial()`, so update schemas never carry defaults (a regression test covers it).
 
-**Writes**
+## 12. Security controls
 
-- Partial updates use `$set` with only the fields provided; `runValidators: true` keeps schema rules on updates.
-- `DELETE /doctors/:id/patients/:patientId` deletes with `{ _id, doctor }` as the filter, so the nested route can only remove a patient that belongs to that doctor (404 otherwise).
-- Deleting a doctor with patients returns **409** with the count; the client can retry with `?cascade=true`, which deletes the doctor and their patients.
+- Passwords: bcrypt cost 12; policy ≥ 8 chars with a letter and a number; timing-safe login.
+- Sessions: see [§6](#6-sessions).
+- **CSRF**: SameSite=Lax cookies plus `verifyOrigin` — state-changing requests with a foreign `Origin` are rejected.
+- **Rate limits**: 300 req/min per IP; failed logins 10 / 15 min keyed by IP + email; registration/refresh 60 / 15 min; bookings 10 / 10 min per account.
+- **Input**: 100 kB JSON cap; `$`/`.` keys stripped; ObjectIds validated; regex input escaped.
+- **Uploads**: raw image bodies capped at 300 kB; type decided by **magic bytes**, not the header; served with `nosniff` and the sniffed type.
+- Headers: helmet; `x-powered-by` off; CORS allow-list with credentials.
+- Payments: only masked instruments stored; no card numbers or PINs persisted.
 
-## 7. Dashboard aggregation
+## 13. Testing strategy
 
-`GET /stats/overview?from&to&interval` runs six independent operations in parallel:
+Integration tests over the real HTTP stack (Supertest → `createApp()` → Mongoose → mongodb-memory-server). Two suites, 42 tests: the original CRUD/search/aggregation suite and a roles-and-booking suite that walks registration, RBAC, the full booking/payment/expiry/refund cycle, session rotation and reuse detection, CSRF and avatar upload. Time-dependent behaviour (hold expiry, refresh grace) is exercised by moving timestamps in the database rather than sleeping.
 
-| # | Operation | Cost |
-|---|---|---|
-| 1 | `DoctorModel.estimatedDocumentCount()` | O(1) collection metadata |
-| 2 | `PatientModel.estimatedDocumentCount()` | O(1) |
-| 3 | `countDocuments` for the previous period (trend %) | index range on `admissionDate` |
-| 4 | `countDocuments` doctors created in range | index range on `createdAt` |
-| 5 | doctors `$group` by specialization | 60-row collection |
-| 6 | **patients `$match` (range) → `$facet`** | one index-backed pass |
-
-The `$facet` (#6) produces, from a single scan of the patients in range:
-
-- `timeline` — `$group` by `$dateTrunc { unit: interval, startOfWeek: 'monday', timezone: 'UTC' }`
-- `byCondition`, `byStatus`, `byGender` — `$group` + `$sort`
-- `byAgeGroup` — `$bucket` with boundaries `0, 18, 30, 45, 60, 75+`
-- `topDoctors` — `$group` by doctor (with a `$cond` count of critical patients) → `$sort` → `$limit 10` → `$lookup` doctor name/specialization. The lookup runs on 10 documents, not on every patient.
-
-The service then fills missing time buckets with zeros so the chart's x-axis is continuous, picks a sensible interval when none is given (≤ 45 days → day, ≤ 180 → week, else month), and computes the period-over-period change. Responses carry `Cache-Control: private, max-age=30`.
-
-## 8. Authentication & authorization
-
-```mermaid
-sequenceDiagram
-    participant B as Browser
-    participant N as Next.js (Vercel)
-    participant A as API (Render)
-    B->>N: POST /api/auth/login {email, password}
-    N->>A: (rewrite) POST /api/auth/login
-    A->>A: rate limit (IP+email) → zod → bcrypt.compare
-    A-->>N: 200 + Set-Cookie dt_token=JWT; HttpOnly; Secure; SameSite=Lax
-    N-->>B: 200 + cookie (first-party, frontend origin)
-    B->>N: GET /patients (page)
-    N->>N: proxy.ts verifies JWT signature + expiry (jose)
-    N-->>B: page shell
-    B->>N: GET /api/patients
-    N->>A: (rewrite, cookie forwarded)
-    A->>A: authenticate → requireRole('admin')
-    A-->>B: 200 data
-```
-
-- **Password storage:** bcrypt, cost 12; the hash is `select: false` and never serialized.
-- **Token:** HS256 JWT with `issuer`, `subject` and a 1-day expiry; the cookie's `maxAge` is derived from the token's own `exp − iat` so both expire together.
-- **Two independent checks:** the frontend proxy verifies the cookie before rendering any protected page (no flash of protected UI, early redirect to `/login?next=…`), and the API verifies it again on every request — the proxy is a UX layer, the API is the security boundary.
-- **Authorization:** `requireRole('admin')` guards everything after `/auth/login`. The role lives in the token, so the guard is a constant-time check with no DB round trip.
-- **Login responses** use one generic message for "unknown email" and "wrong password" to prevent account enumeration.
-- **Bearer support:** `Authorization: Bearer <token>` is accepted too, for API clients and tests.
-
-## 9. Validation & error handling
-
-Every route declares its contract with zod: `validate({ body, query, params })` parses, coerces (`"2"` → `2`, `"2026-01-31"` → `Date`), applies defaults and stores the result on `req.validated` (Express 5's `req.query` is read-only). Controllers only ever read validated data.
-
-One error middleware maps every failure to the same shape:
-
-| Source | Status | `code` |
-|---|---|---|
-| `ZodError` | 400 | `VALIDATION_ERROR` + `details: [{ field, message }]` |
-| Mongoose `ValidationError` / `CastError` | 400 | `VALIDATION_ERROR` / `BAD_REQUEST` |
-| Malformed JSON / body > 100 kB | 400 / 413 | `BAD_REQUEST` / `PAYLOAD_TOO_LARGE` |
-| Missing / invalid token | 401 | `UNAUTHORIZED` |
-| Wrong role | 403 | `FORBIDDEN` |
-| Unknown id or route | 404 | `NOT_FOUND` |
-| Duplicate key (E11000) | 409 | `CONFLICT` + `details.field` |
-| Rate limit | 429 | `TOO_MANY_REQUESTS` |
-| Anything else | 500 | `INTERNAL_ERROR` (stack only outside production) |
-
-Field-level `details` let the frontend put server errors right under the matching input.
-
-A Zod 4 subtlety worth noting: defaults apply even inside `.partial()` schemas, so `status` has no default on the shared patient schema — only the create schemas add `.default('Active')`. Otherwise every PATCH would silently reset the status (covered by a regression test).
-
-## 10. Security controls
-
-- `helmet` security headers; `x-powered-by` disabled.
-- CORS allow-list from `CLIENT_ORIGIN` with credentials.
-- Rate limits: 300 req/min per IP on `/api`, and 10 failed logins / 15 min keyed by **IP + email** (requests arrive via the frontend proxy, so IP alone would group unrelated users).
-- `trust proxy` set to 1 hop for correct client IPs behind Render.
-- Body size capped at 100 kB; keys starting with `$` or containing `.` are stripped from bodies (operator-injection defense in depth on top of zod's strict shapes).
-- Every id is validated as an ObjectId before it reaches a query; regex input is escaped.
-- Environment validated at boot (`JWT_SECRET` ≥ 32 chars, URI present) — misconfiguration fails fast instead of at the first request.
-
-## 11. Testing strategy
-
-Integration tests over the real HTTP stack (Supertest → `createApp()` → Mongoose → mongodb-memory-server). This tests what matters for an API — status codes, response shapes, auth, validation and query behaviour — without mocking the database.
-
-## 12. Deployment
+## 14. Deployment
 
 | Piece | Where | Notes |
 |---|---|---|
-| API | Render free web service (`render.yaml`) | build `npm ci --include=dev && npm run build`, start `node dist/server.js`, health `/api/health`, auto-deploy from `main` |
-| Database | MongoDB Atlas M0 (AWS ap-south-1) | dedicated least-privilege DB user; network access open for Render's dynamic IPs |
+| API | Render free web service, Singapore (`render.yaml`) | build `npm ci --include=dev && npm run build`, start `node dist/server.js`, health `/api/health`, auto-deploy from `main` |
+| Database | MongoDB Atlas M0, AWS Mumbai | least-privilege app user (`readWriteAnyDatabase`); network access open for Render's dynamic IPs |
 | Secrets | Render dashboard | `MONGODB_URI`, `JWT_SECRET`, `CLIENT_ORIGIN` — never committed |
 
-Graceful shutdown: on `SIGTERM`/`SIGINT` the server stops accepting connections, finishes in-flight requests, then closes the Mongo pool — which matters on Render, where deploys send `SIGTERM`.
+Graceful shutdown stops the sweeper, drains connections and closes the pool on `SIGTERM`.
 
-## 13. Scalability considerations
+## 15. Scalability considerations
 
-What is in place, and what would change at larger scale:
-
-- **Stateless API** — sessions are JWTs, so instances scale horizontally behind a load balancer with no sticky sessions. (Rate-limit counters are in memory per instance; with several instances they would move to Redis.)
-- **Pagination** — offset (`skip`) pagination is simple and supports "jump to page N", and is fine at this size. For very deep pages on millions of rows the next step is **keyset (cursor) pagination** on the existing `{ field, _id }` sort keys, which the indexes already support.
-- **Counts** — `countDocuments` on a filtered set is index-backed; at very large scale the UI would switch to "estimated" totals or cache counts per filter.
-- **Search** — prefix search scales with the index. Fuzzy, infix or typo-tolerant search would move to **Atlas Search** (Lucene) rather than slower regexes.
-- **Dashboard** — the `$facet` pass is bounded by the date range. For heavy traffic, the overview could be pre-aggregated per day into a small `daily_stats` collection (or a materialized view via `$merge`) and the endpoint would read ~365 tiny documents instead of scanning patients.
-- **Reads vs writes** — Atlas replica sets allow `readPreference: secondaryPreferred` for the analytics endpoint if it ever competes with writes.
-- **Multi-tenancy / roles** — `requireRole` already takes a role list; adding `viewer` or per-hospital scoping is a schema + guard change, not a rewrite.
+- **Stateless API**: access tokens are verified without a DB hit, so instances scale horizontally. Rate-limit counters and the hold sweeper are per instance today; with several instances the counters move to Redis and the sweeper stays idempotent (it's a conditional `updateMany`).
+- **Double booking stays correct at any scale** because the guarantee is a database unique index, not application locking.
+- **Pagination**: offset pagination today; keyset pagination on the existing `{ field, _id }` sort keys for very deep pages.
+- **Search** moves to Atlas Search for fuzzy/infix matching.
+- **Dashboard** can be pre-aggregated per day with `$merge` if traffic grows; analytics reads can use `secondaryPreferred`.
+- **Real payments** slot in behind `chargeInstrument`: create a gateway intent at booking, confirm via webhook with the same conditional update, keep the hold semantics unchanged.
+- **Avatars** move to object storage (S3/R2) by changing only `avatar.service`; URLs are already versioned and cache-friendly.

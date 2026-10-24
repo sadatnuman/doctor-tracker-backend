@@ -25,6 +25,10 @@ const envSchema = z.object({
   SEED_DOCTOR_PASSWORD: z.string().min(8).default('Doctor@12345'),
   SEED_PATIENT_EMAIL: z.email().default('patient@doctortracker.com'),
   SEED_PATIENT_PASSWORD: z.string().min(8).default('Patient@12345'),
+}).refine((e) => e.NODE_ENV !== 'production' || !e.JWT_SECRET.startsWith('change-me'), {
+  // A copied .env.example secret would let anyone mint valid tokens.
+  path: ['JWT_SECRET'],
+  message: 'JWT_SECRET is still the .env.example placeholder; generate a real secret for production',
 });
 
 const parsed = envSchema.safeParse(process.env);

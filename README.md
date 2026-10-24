@@ -265,9 +265,14 @@ tests/            API integration tests
 
 ## Deployment
 
-Deployed on **Render** (free web service, Singapore — closest to the Atlas cluster in Mumbai) from `main` using [`render.yaml`](./render.yaml): build `npm ci --include=dev && npm run build`, start `npm start`, health check `/api/health`. Set `MONGODB_URI`, `JWT_SECRET` and `CLIENT_ORIGIN` (the Vercel URL) in the dashboard. Indexes are synced explicitly on boot in production.
+Deployed on **Render** from `main` using [`render.yaml`](./render.yaml): a free web service in Singapore, the closest region to the Atlas cluster in Mumbai. Build `npm ci --include=dev && npm run build`, start `npm start`, health check `/api/health`. Indexes are synced explicitly on boot in production.
 
-> Free Render instances sleep after ~15 minutes idle; the first request afterwards takes up to a minute. The frontend shows a "waking the server" notice and its public pages are served from cache meanwhile.
+1. **Create the service** from the blueprint, then set these three values in the dashboard:
+   - `MONGODB_URI`: the Atlas `mongodb+srv://` string.
+   - `JWT_SECRET`: a fresh value (`openssl rand -base64 48`), not the local one. The frontend must use exactly the same value. The API refuses to start in production with the `.env.example` placeholder.
+   - `CLIENT_ORIGIN`: the Vercel URL. Comma-separate several origins if needed.
+2. **Deploy the API before the frontend.** The frontend prerenders its public pages from the API at build time, so open `/api/health` once to wake the API before the Vercel build starts.
+3. **Keep it warm (optional).** Free Render instances sleep after about 15 idle minutes, and the next request waits up to a minute. The [Keep API warm](./.github/workflows/keep-warm.yml) workflow pings the health check every 10 minutes: set the repository variable `API_HEALTH_URL` (Settings → Secrets and variables → Actions → Variables). Until then, the frontend shows a "waking the server" notice and serves its public pages from cache.
 
 ## Visual evidence
 

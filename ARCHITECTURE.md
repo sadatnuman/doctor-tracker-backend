@@ -306,7 +306,8 @@ Integration tests over the real HTTP stack (Supertest → `createApp()` → Mong
 |---|---|---|
 | API | Render free web service, Singapore (`render.yaml`) | build `npm ci --include=dev && npm run build`, start `node dist/server.js`, health `/api/health`, auto-deploy from `main` |
 | Database | MongoDB Atlas M0, AWS Mumbai | least-privilege app user (`readWriteAnyDatabase`); network access open for Render's dynamic IPs |
-| Secrets | Render dashboard | `MONGODB_URI`, `JWT_SECRET`, `CLIENT_ORIGIN` — never committed |
+| Secrets | Render dashboard | `MONGODB_URI`, `JWT_SECRET`, `CLIENT_ORIGIN`, never committed. In production the env schema rejects the `.env.example` placeholder secret. |
+| Keep-warm | GitHub Actions (`keep-warm.yml`) | pings `/api/health` every 10 minutes when the `API_HEALTH_URL` repository variable is set, so the free instance (and the hold sweeper) stays awake |
 
 Graceful shutdown stops the sweeper, drains connections and closes the pool on `SIGTERM`.
 

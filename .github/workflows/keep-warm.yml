@@ -1,0 +1,27 @@
+# Render's free plan sleeps after 15 idle minutes, and the first request then waits for a
+# cold start. Pinging the health check every 10 minutes keeps the API (and its payment-hold
+# sweeper) awake. Set the repository variable API_HEALTH_URL, e.g.
+# https://doctor-tracker-api.onrender.com/api/health. Without it the job does nothing.
+name: Keep API warm
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Ping health check
+        env:
+          URL: ${{ vars.API_HEALTH_URL }}
+        run: |
+          if [ -z "$URL" ]; then
+            echo "API_HEALTH_URL is not set; skipping."
+            exit 0
+          fi
+          curl --fail --silent --show-error --max-time 90 --retry 2 --retry-delay 10 "$URL"
